@@ -14,6 +14,7 @@ menuLoop :: IO ()
 menuLoop = do
   putStrLn "\nExamples:"
   mapM_ printMenuItem (zip [1 :: Int ..] exampleSpecs)
+  putStrLn "  9. Prove a proposition (Chapter 10)"
   putStrLn "  0. Exit"
   putStr "Choose an example number: "
   hFlush stdout
@@ -25,6 +26,9 @@ menuLoop = do
       case map toLower choice of
         "q" -> putStrLn "Goodbye."
         "0" -> putStrLn "Goodbye."
+        "9" -> do
+          proveLoop
+          menuLoop
         _ ->
           case readMaybe choice of
             Just number
@@ -35,11 +39,34 @@ menuLoop = do
               putStrLn "Please enter one of the listed numbers, 0, or q."
               menuLoop
 
-printMenuItem :: (Int, (String, String, [Formula])) -> IO ()
+proveLoop :: IO ()
+proveLoop = do
+  putStrLn "\nChapter 10 theorem prover (default facts are included)."
+  putStrLn "Enter a formula in Lisp-style syntax, or type 'back' to return."
+  proofPrompt
+  where
+    proofPrompt = do
+      putStr "\nFormula> "
+      hFlush stdout
+      atEnd <- isEOF
+      if atEnd
+        then putStrLn "\nReturning to the main menu."
+        else do
+          source <- getLine
+          if map toLower source == "back"
+            then pure ()
+            else do
+              case proveText source of
+                Left problem -> putStrLn ("Input error: " ++ problem)
+                Right True -> putStrLn "Proved."
+                Right False -> putStrLn "Could not prove this formula."
+              proofPrompt
+
+printMenuItem :: (Int, (String, String, [Fact])) -> IO ()
 printMenuItem (number, (name, _, _)) =
   putStrLn ("  " ++ show number ++ ". " ++ name)
 
-runExample :: (String, String, [Formula]) -> IO ()
+runExample :: (String, String, [Fact]) -> IO ()
 runExample (name, source, facts) = do
   putStrLn ("\n== " ++ name ++ " ==")
   putStrLn "Annotated WHILE specification:"

@@ -3,18 +3,26 @@ module Verifier
   , Formula (..)
   , Statement (..)
   , Spec (..)
+  , Fact (..)
   , VerificationResult (..)
   , parseSpec
   , verificationConditions
   , verifyText
+  , prove
+  , proveText
+  , parseFact
+  , parseFacts
   , prettyTerm
   , prettyFormula
+  , logicFacts
+  , arithmeticFacts
+  , defaultFacts
   , exampleSpecs
   , verifySpec
   ) where
 
 import Data.Char (isSpace)
-import Data.List (foldl', sort)
+import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 
@@ -39,6 +47,7 @@ data Formula
   | And Formula Formula
   | Not Formula
   | Implies Formula Formula
+  | FormulaMeta String
   deriving (Eq, Ord, Show)
 
 data Statement
@@ -52,6 +61,14 @@ data Statement
   deriving (Eq, Ord, Show)
 
 data Spec = Spec Formula Statement Formula
+  deriving (Eq, Ord, Show)
+
+-- Rewriting and implication facts used by the generic proof engine.
+data Fact
+  = TermRewrite Term Term
+  | TermEquation Term Term
+  | FormulaRewrite Formula Formula
+  | FormulaImplication Formula Formula
   deriving (Eq, Ord, Show)
 
 data VerificationResult = VerificationResult
@@ -123,6 +140,8 @@ parseTerm (Atom token) =
     _ -> Right (Variable token)
 parseTerm (List [Atom "max", left, right]) =
   Maximum <$> parseTerm left <*> parseTerm right
+parseTerm (List [Atom "-", value]) =
+  Subtract (Integer 0) <$> parseTerm value
 parseTerm (List [left, Atom operator, right]) = do
   a <- parseTerm left
   b <- parseTerm right
@@ -137,7 +156,9 @@ parseTerm _ = Left "Malformed arithmetic expression."
 
 parseFormula :: SExpr -> Either String Formula
 parseFormula (Atom "T") = Right Truth
+parseFormula (Atom "F") = Right Falsity
 parseFormula (Atom "NIL") = Right Falsity
+parseFormula (Atom name) = Right (FormulaMeta name)
 parseFormula (List [left, Atom "=", right]) =
   Equal <$> parseTerm left <*> parseTerm right
 parseFormula (List [left, Atom "<", right]) =
@@ -155,7 +176,44 @@ parseFormula (List [left, Atom "and", right]) =
 parseFormula (List [Atom "not", formula]) = Not <$> parseFormula formula
 parseFormula (List [Atom "implies", left, right]) =
   Implies <$> parseFormula left <*> parseFormula right
+parseFormula (List [left, Atom "implies", right]) =
+  Implies <$> parseFormula left <*> parseFormula right
 parseFormula _ = Left "Malformed boolean expression."
+
+-- Parse an equation and infer whether it rewrites terms or formulas.
+parseFact :: String -> Either String Fact
+parseFact source = do
+  expression <- parseSExpr source
+  case expression of
+    List [Atom "TERM-REWRITE", left, right] ->
+      TermRewrite <$> parseTerm left <*> parseTerm right
+    List [Atom "TERM-EQUATION", left, right] ->
+      TermEquation <$> parseTerm left <*> parseTerm right
+    List [Atom "FORMULA-REWRITE", left, right] ->
+      FormulaRewrite <$> parseFormula left <*> parseFormula right
+    List [Atom "FORMULA-IMPLIES", antecedent, consequent] ->
+      FormulaImplication <$> parseFormula antecedent <*> parseFormula consequent
+    List [left, Atom "=", right]
+      | isFormulaExpression left || isFormulaExpression right ->
+          FormulaRewrite <$> parseFormula left <*> parseFormula right
+      | otherwise ->
+          TermRewrite <$> parseTerm left <*> parseTerm right
+    _ -> Left "Expected a fact equation of the form ((left) = (right))."
+
+parseFacts :: [String] -> Either String [Fact]
+parseFacts = traverse parseFact
+
+isFormulaExpression :: SExpr -> Bool
+isFormulaExpression expression =
+  case expression of
+    Atom "T" -> True
+    Atom "F" -> True
+    Atom "NIL" -> True
+    List [_, Atom operator, _] ->
+      operator `elem` ["=", "<", "<=", ">", ">=", "and", "implies"]
+    List (Atom operator : _) ->
+      operator `elem` ["=", "<", "<=", ">", ">=", "and", "not", "implies"]
+    _ -> False
 
 -- Check sequence annotations and the side condition required by FOR.
 validateSpec :: Spec -> Either String Spec
@@ -322,197 +380,255 @@ substituteFormula variable replacement formula =
     And a b -> And (recur a) (recur b)
     Not a -> Not (recur a)
     Implies a b -> Implies (recur a) (recur b)
+    FormulaMeta _ -> formula
   where
     recur = substituteFormula variable replacement
 
-type Polynomial = Map.Map [Term] Rational
+-- Facts are directed rewrite rules; variables in their patterns are metavariables.
+logicFacts :: [Fact]
+logicFacts =
+  factsFromSource
+    [ "((T implies X) = X)"
+    , "((F implies X) = T)"
+    , "((X implies T) = T)"
+    , "((X implies X) = T)"
+    , "((T and X) = X)"
+    , "((X and T) = X)"
+    , "((F and X) = F)"
+    , "((X and F) = F)"
+    , "((X = X) = T)"
+    , "(((X and Y) implies Z) = (X implies (Y implies Z)))"
+    ]
 
--- Normalize arithmetic expressions into polynomials when possible.
-polynomial :: Term -> Polynomial
-polynomial term =
-  case simplifyTerm term of
-    Integer n -> constant (fromInteger n)
-    asVariable@(Variable _) -> monomial asVariable
-    Add a b ->
-      case triangularSum a b of
-        Just result -> atomPolynomial result
-        Nothing -> addPolynomials (polynomial a) (polynomial b)
-    Subtract a b -> addPolynomials (polynomial a) (scalePolynomial (-1) (polynomial b))
-    Multiply a b -> multiplyPolynomials (polynomial a) (polynomial b)
-    Divide numerator divisor ->
-      case (simplifyTerm numerator, simplifyTerm divisor) of
-        (Integer a, Integer b) | b /= 0 -> constant (fromInteger (a `div` b))
-        (productTerm, Integer 2) ->
-          case consecutiveProduct productTerm of
-            Just value -> atomPolynomial (Triangular value)
-            Nothing -> atomPolynomial (Divide productTerm (Integer 2))
-        (a, b) -> atomPolynomial (Divide a b)
-    Maximum a b -> atomPolynomial (Maximum (canonicalTerm a) (canonicalTerm b))
-    Triangular a -> atomPolynomial (Triangular (canonicalTerm a))
+-- The arithmetic knowledge base is expressed as directed, reusable rewrite facts.
+arithmeticFacts :: [Fact]
+arithmeticFacts =
+  factsFromSource
+    [ "((X + 0) = X)"
+    , "((0 + X) = X)"
+    , "((X * 0) = 0)"
+    , "((0 * X) = 0)"
+    , "((X * 1) = X)"
+    , "((1 * X) = X)"
+    , "((not (X <= Y)) = (Y < X))"
+    , "((not (X >= Y)) = (Y > X))"
+    , "((not (X < Y)) = (X >= Y))"
+    , "(((- X) >= (- Y)) = (X <= Y))"
+    , "(((- X) >= Y) = (X <= (- Y)))"
+    , "((- 0) = 0)"
+    , "(((X < Y) implies (X <= Y)) = T)"
+    , "((X - X) = 0)"
+    , "(((X + Y) - Z) = (X + (Y - Z)))"
+    , "(((X - Y) * Z) = ((X * Z) - (Y * Z)))"
+    , "((X * (Y + Z)) = ((X * Y) + (X * Z)))"
+    , "(((X + Y) * Z) = ((X * Z) + (Y * Z)))"
+    , "(((X >= Y) implies ((X < Y) implies Z)) = T)"
+    , "(((X <= Y) implies ((Y < X) implies Z)) = T)"
+    , "((0 DIV X) = 0)"
+    , "(((X DIV Y) + Z) = ((X + (Y * Z)) DIV Y))"
+    , "(((X - Y) + Z) = (X + (Z - Y)))"
+    , "((2 * X) = (X + X))"    
+    , "((X + Y) = (Y + X))"
+    , "((X * Y) = (Y * X))"
+    ]
 
-canonicalTerm :: Term -> Term
-canonicalTerm term =
-  case simplifyTerm term of
-    Add a b -> Add (canonicalTerm a) (canonicalTerm b)
-    Subtract a b -> Subtract (canonicalTerm a) (canonicalTerm b)
-    Multiply a b -> Multiply (canonicalTerm a) (canonicalTerm b)
-    Divide a b -> Divide (canonicalTerm a) (canonicalTerm b)
-    Maximum a b -> Maximum (canonicalTerm a) (canonicalTerm b)
-    Triangular a -> Triangular (canonicalTerm a)
-    other -> other
+factsFromSource :: [String] -> [Fact]
+factsFromSource sources =
+  case parseFacts sources of
+    Right facts -> facts
+    Left problem -> error ("Invalid built-in proof fact: " ++ problem)
 
-simplifyTerm :: Term -> Term
-simplifyTerm term =
-  case term of
-    Add left right ->
-      simplifyAdd (simplifyTerm left) (simplifyTerm right)
-    Subtract left right ->
-      simplifySubtract (simplifyTerm left) (simplifyTerm right)
-    Multiply left right ->
-      simplifyMultiply (simplifyTerm left) (simplifyTerm right)
-    Divide left right ->
-      Divide (simplifyTerm left) (simplifyTerm right)
-    Maximum left right ->
-      Maximum (simplifyTerm left) (simplifyTerm right)
-    Triangular value -> Triangular (simplifyTerm value)
-    other -> other
+defaultFacts :: [Fact]
+defaultFacts = logicFacts ++ arithmeticFacts
 
-simplifyAdd :: Term -> Term -> Term
-simplifyAdd (Integer a) (Integer b) = Integer (a + b)
-simplifyAdd (Integer 0) b = b
-simplifyAdd a (Integer 0) = a
-simplifyAdd (Subtract a (Integer n)) (Integer m) | n == m = a
-simplifyAdd (Integer n) (Subtract a (Integer m)) | n == m = a
-simplifyAdd (Triangular a) b | sameTerm a b = Triangular (simplifyAdd a (Integer 1))
-simplifyAdd a (Triangular b) | sameTerm a b = Triangular (simplifyAdd b (Integer 1))
-simplifyAdd a b = Add a b
+rewriteTerm :: [Fact] -> Term -> Term
+rewriteTerm facts = rewrite 0 Set.empty
+  where
+    rewrite :: Int -> Set.Set Term -> Term -> Term
+    rewrite fuel seen term
+      | fuel >= 64 || term `Set.member` seen = term
+      | otherwise =
+          let nextSeen = Set.insert term seen
+              descended = descend (rewrite (fuel + 1) Set.empty) term
+          in case applyRule descended of
+               Just result | result /= descended ->
+                 rewrite (fuel + 1) nextSeen result
+               _ -> descended
 
-simplifySubtract :: Term -> Term -> Term
-simplifySubtract (Integer a) (Integer b) = Integer (a - b)
-simplifySubtract a (Integer 0) = a
-simplifySubtract a b | sameTerm a b = Integer 0
-simplifySubtract (Add a (Integer n)) (Integer m) | n == m = a
-simplifySubtract (Add (Integer n) a) (Integer m) | n == m = a
-simplifySubtract a b = Subtract a b
+    descend recurse term =
+      case term of
+        Add a b -> Add (recurse a) (recurse b)
+        Subtract a b -> Subtract (recurse a) (recurse b)
+        Multiply a b -> Multiply (recurse a) (recurse b)
+        Divide a b -> Divide (recurse a) (recurse b)
+        Maximum a b -> Maximum (recurse a) (recurse b)
+        Triangular a -> Triangular (recurse a)
+        other -> other
 
-simplifyMultiply :: Term -> Term -> Term
-simplifyMultiply (Integer a) (Integer b) = Integer (a * b)
-simplifyMultiply (Integer 0) _ = Integer 0
-simplifyMultiply _ (Integer 0) = Integer 0
-simplifyMultiply (Integer 1) b = b
-simplifyMultiply a (Integer 1) = a
-simplifyMultiply a b = Multiply a b
+    -- Keep reversible equations for equality proving, not normalization.
+    applyRule term =
+      firstJust
+        [ Just result
+        | fact <- facts
+        , Just result <- [rewriteWithFact term fact]
+        , not (rewritesBack result term)
+        ]
 
-sameTerm :: Term -> Term -> Bool
-sameTerm a b = canonicalTerm a == canonicalTerm b
+    rewritesBack source target =
+      any ((== Just target) . rewriteWithFact source) facts
 
-triangularSum :: Term -> Term -> Maybe Term
-triangularSum left right =
-  case (asTriangular left, asTriangular right) of
-    (Just a, _) | sameTerm a right -> Just (Triangular (simplifyAdd a (Integer 1)))
-    (_, Just b) | sameTerm left b -> Just (Triangular (simplifyAdd b (Integer 1)))
-    _ -> Nothing
+    rewriteWithFact term (TermRewrite patternTerm replacement) = do
+      bindings <- matchTerms emptyBindings patternTerm term
+      pure (instantiateTerm bindings replacement)
+    rewriteWithFact _ _ = Nothing
 
-asTriangular :: Term -> Maybe Term
-asTriangular term =
-  case simplifyTerm term of
-    Triangular value -> Just value
-    Divide numerator (Integer 2) ->
-      consecutiveProduct numerator
-    _ -> Nothing
+rewriteFormula :: [Fact] -> Formula -> Formula
+rewriteFormula facts = rewrite 0
+  where
+    rewrite :: Int -> Formula -> Formula
+    rewrite fuel formula
+      | fuel >= 64 = formula
+      | otherwise =
+          let descended = descend (fuel + 1) formula
+          in case applyRule descended of
+               Just result | result /= descended -> rewrite (fuel + 1) result
+               _ -> descended
 
-consecutiveProduct :: Term -> Maybe Term
-consecutiveProduct (Multiply a b)
-  | isPrevious a b = Just (canonicalTerm b)
-  | isPrevious b a = Just (canonicalTerm a)
-consecutiveProduct _ = Nothing
+    descend fuel formula =
+      case formula of
+        Equal a b -> Equal (rewriteTerm facts a) (rewriteTerm facts b)
+        Less a b -> Less (rewriteTerm facts a) (rewriteTerm facts b)
+        LessEqual a b -> LessEqual (rewriteTerm facts a) (rewriteTerm facts b)
+        And a b -> And (rewrite fuel a) (rewrite fuel b)
+        Not a -> Not (rewrite fuel a)
+        Implies a b -> Implies (rewrite fuel a) (rewrite fuel b)
+        FormulaMeta _ -> formula
+        other -> other
 
-isPrevious :: Term -> Term -> Bool
-isPrevious candidate successor =
-  sameTerm candidate (simplifySubtract successor (Integer 1))
+    applyRule formula = firstJust (map (rewriteWithFact formula) facts)
+    rewriteWithFact formula (FormulaRewrite patternFormula replacement) = do
+      bindings <- matchFormula emptyBindings patternFormula formula
+      pure (instantiateFormula bindings replacement)
+    rewriteWithFact _ _ = Nothing
 
-atomPolynomial :: Term -> Polynomial
-atomPolynomial term = monomial (canonicalTerm term)
+firstJust :: [Maybe a] -> Maybe a
+firstJust [] = Nothing
+firstJust (Just value : _) = Just value
+firstJust (Nothing : rest) = firstJust rest
 
-constant :: Rational -> Polynomial
-constant 0 = Map.empty
-constant number = Map.singleton [] number
-
-monomial :: Term -> Polynomial
-monomial term = Map.singleton [term] 1
-
-addPolynomials :: Polynomial -> Polynomial -> Polynomial
-addPolynomials a b = Map.filter (/= 0) (Map.unionWith (+) a b)
-
-scalePolynomial :: Rational -> Polynomial -> Polynomial
-scalePolynomial factor = Map.filter (/= 0) . Map.map (factor *)
-
-multiplyPolynomials :: Polynomial -> Polynomial -> Polynomial
-multiplyPolynomials a b =
-  Map.filter (/= 0) $
-    Map.fromListWith (+)
-      [ (sort (left ++ right), x * y)
-      | (left, x) <- Map.toList a
-      , (right, y) <- Map.toList b
-      ]
-
-verifyText :: [Formula] -> String -> Either String VerificationResult
+verifyText :: [Fact] -> String -> Either String VerificationResult
 verifyText facts source = parseSpec source >>= verifySpec facts
 
+-- Prove one formula using the built-in Chapter 10/11 facts.
+prove :: Formula -> Bool
+prove = proveFormula defaultFacts []
+
+-- Parse and prove a single formula without requiring a WHILE specification.
+proveText :: String -> Either String Bool
+proveText source = do
+  expression <- parseSExpr source
+  formula <- parseFormula expression
+  pure (prove formula)
+
 -- Generate VCs, then keep the ones the bounded prover cannot discharge.
-verifySpec :: [Formula] -> Spec -> Either String VerificationResult
+verifySpec :: [Fact] -> Spec -> Either String VerificationResult
 verifySpec facts spec = do
   conditions <- verificationConditions spec
-  let failures = filter (not . proveFormula facts []) conditions
+  let allFacts = defaultFacts ++ facts
+      failures = filter (not . proveFormula allFacts []) conditions
   pure (VerificationResult conditions failures)
 
-proveFormula :: [Formula] -> [Formula] -> Formula -> Bool
+proveFormula :: [Fact] -> [Formula] -> Formula -> Bool
 proveFormula facts assumptions goal =
-  let normalizedAssumptions = map normalizeFormula (concatMap flattenAnd assumptions)
+  let normalizedAssumptions =
+        concatMap (flattenAnd . rewriteFormula facts) assumptions
       substitutions = equalitySubstitutions normalizedAssumptions
-      normalizedGoal = normalizeFormula (substituteAllFormula substitutions goal)
-  in inconsistent normalizedAssumptions
+      normalizedGoal =
+        rewriteFormula facts (substituteAllFormula substitutions goal)
+  in contradictoryByFacts facts normalizedAssumptions
       || normalizedGoal == Truth
       || normalizedGoal `elem` normalizedAssumptions
       || proveByShape facts normalizedAssumptions normalizedGoal
 
-proveByShape :: [Formula] -> [Formula] -> Formula -> Bool
+proveByShape :: [Fact] -> [Formula] -> Formula -> Bool
 proveByShape facts assumptions goal =
   case goal of
     Truth -> True
-    Falsity -> False
+    Falsity -> applyFacts facts assumptions goal
     And left right ->
       proveFormula facts assumptions left && proveFormula facts assumptions right
     Implies antecedent consequent ->
       proveFormula facts (antecedent : assumptions) consequent
     Not proposition ->
-      inconsistent (normalizeFormula proposition : assumptions)
+      proveFormula facts (proposition : assumptions) Falsity
     Equal left right ->
-      polynomial left == polynomial right || applyFacts facts assumptions goal
+      left == right
+        || rewriteTerm facts left == rewriteTerm facts right
+        || termRewriteProves facts left right
+        || termEquationProves facts left right
+        || applyFacts facts assumptions goal
     Less left right ->
-      knownComparison assumptions (Less left right)
-        || maybe False (uncurry (<)) (constantPair left right)
-        || applyFacts facts assumptions goal
+      knownComparison assumptions (Less left right) || applyFacts facts assumptions goal
     LessEqual left right ->
-      knownComparison assumptions (LessEqual left right)
-        || maybe False (uncurry (<=)) (constantPair left right)
-        || applyFacts facts assumptions goal
+      knownComparison assumptions (LessEqual left right) || applyFacts facts assumptions goal
+    FormulaMeta _ -> False
 
-applyFacts :: [Formula] -> [Formula] -> Formula -> Bool
+applyFacts :: [Fact] -> [Formula] -> Formula -> Bool
 applyFacts facts assumptions goal =
   any proveWithFact facts
   where
-    proveWithFact (Implies patternAntecedent patternConsequent) =
-      case matchFormula Map.empty patternConsequent goal of
+    proveWithFact (FormulaImplication patternAntecedent patternConsequent) =
+      case matchFormula emptyBindings patternConsequent goal of
         Nothing -> False
         Just bindings ->
           let antecedent = instantiateFormula bindings patternAntecedent
-          in proveFormula [] assumptions antecedent
+          in proveFormula facts assumptions antecedent
     proveWithFact _ = False
 
-matchFormula :: Map.Map String Term -> Formula -> Formula -> Maybe (Map.Map String Term)
+termEquationProves :: [Fact] -> Term -> Term -> Bool
+termEquationProves facts left right = any matches facts
+  where
+    matches (TermEquation patternLeft patternRight) =
+      matchesDirection patternLeft patternRight
+        || matchesDirection patternRight patternLeft
+    matches _ = False
+
+    matchesDirection patternLeft patternRight =
+      case matchTerms emptyBindings patternLeft left of
+        Nothing -> False
+        Just bindings -> instantiateTerm bindings patternRight == right
+
+termRewriteProves :: [Fact] -> Term -> Term -> Bool
+termRewriteProves facts left right = any matches facts
+  where
+    matches (TermRewrite patternLeft patternRight) =
+      matchesDirection patternLeft patternRight
+        || matchesDirection patternRight patternLeft
+    matches _ = False
+
+    matchesDirection patternLeft patternRight =
+      case matchTerms emptyBindings patternLeft left of
+        Nothing -> False
+        Just bindings -> instantiateTerm bindings patternRight == right
+
+data MatchBindings = MatchBindings
+  { termBindings :: Map.Map String Term
+  , formulaBindings :: Map.Map String Formula
+  }
+
+emptyBindings :: MatchBindings
+emptyBindings = MatchBindings Map.empty Map.empty
+
+matchFormula :: MatchBindings -> Formula -> Formula -> Maybe MatchBindings
 matchFormula bindings patternFormula valueFormula =
   case (patternFormula, valueFormula) of
+    (FormulaMeta name, value) ->
+      case Map.lookup name (formulaBindings bindings) of
+        Nothing ->
+          Just bindings
+            { formulaBindings = Map.insert name value (formulaBindings bindings) }
+        Just existing | existing == value -> Just bindings
+                      | otherwise -> Nothing
     (Truth, Truth) -> Just bindings
     (Falsity, Falsity) -> Just bindings
     (Equal a b, Equal x y) -> matchTerms bindings a x >>= \next -> matchTerms next b y
@@ -525,12 +641,14 @@ matchFormula bindings patternFormula valueFormula =
       matchFormula bindings a x >>= \next -> matchFormula next b y
     _ -> Nothing
 
-matchTerms :: Map.Map String Term -> Term -> Term -> Maybe (Map.Map String Term)
+matchTerms :: MatchBindings -> Term -> Term -> Maybe MatchBindings
 matchTerms bindings patternTerm valueTerm =
   case patternTerm of
     Variable name ->
-      case Map.lookup name bindings of
-        Nothing -> Just (Map.insert name valueTerm bindings)
+      case Map.lookup name (termBindings bindings) of
+        Nothing ->
+          Just bindings
+            { termBindings = Map.insert name valueTerm (termBindings bindings) }
         Just existing | existing == valueTerm -> Just bindings
                       | otherwise -> Nothing
     Integer number ->
@@ -545,13 +663,27 @@ matchTerms bindings patternTerm valueTerm =
         Triangular x -> matchTerms bindings a x
         _ -> Nothing
 
+instantiateTerm :: MatchBindings -> Term -> Term
+instantiateTerm bindings = go
+  where
+    go term =
+      case term of
+        Variable name -> Map.findWithDefault term name (termBindings bindings)
+        Integer _ -> term
+        Add a b -> Add (go a) (go b)
+        Subtract a b -> Subtract (go a) (go b)
+        Multiply a b -> Multiply (go a) (go b)
+        Divide a b -> Divide (go a) (go b)
+        Maximum a b -> Maximum (go a) (go b)
+        Triangular a -> Triangular (go a)
+
 matchBinary
-  :: Map.Map String Term
+  :: MatchBindings
   -> (Term -> Term -> Term)
   -> Term
   -> Term
   -> Term
-  -> Maybe (Map.Map String Term)
+  -> Maybe MatchBindings
 matchBinary bindings constructor a b valueTerm
   | termConstructorMatches constructor valueTerm =
       let (x, y) = termChildren valueTerm
@@ -585,12 +717,22 @@ termChildren (Divide a b) = (a, b)
 termChildren (Maximum a b) = (a, b)
 termChildren _ = (Integer 0, Integer 0)
 
-instantiateFormula :: Map.Map String Term -> Formula -> Formula
-instantiateFormula bindings formula =
-  foldl'
-    (\current (name, value) -> substituteFormula name value current)
-    formula
-    (Map.toList bindings)
+instantiateFormula :: MatchBindings -> Formula -> Formula
+instantiateFormula bindings = go
+  where
+    go formula =
+      case formula of
+        FormulaMeta name ->
+          maybe formula go (Map.lookup name (formulaBindings bindings))
+        Truth -> Truth
+        Falsity -> Falsity
+        Equal a b -> Equal (instantiateTerm bindings a) (instantiateTerm bindings b)
+        Less a b -> Less (instantiateTerm bindings a) (instantiateTerm bindings b)
+        LessEqual a b ->
+          LessEqual (instantiateTerm bindings a) (instantiateTerm bindings b)
+        And a b -> And (go a) (go b)
+        Not proposition -> Not (go proposition)
+        Implies antecedent consequent -> Implies (go antecedent) (go consequent)
 
 flattenAnd :: Formula -> [Formula]
 flattenAnd (And left right) = flattenAnd left ++ flattenAnd right
@@ -619,6 +761,7 @@ substituteAllFormula substitutions = goFormula Set.empty
         And a b -> And (goFormula seen a) (goFormula seen b)
         Not a -> Not (goFormula seen a)
         Implies a b -> Implies (goFormula seen a) (goFormula seen b)
+        FormulaMeta _ -> formula
     goTerm seen term =
       case term of
         Variable name
@@ -635,82 +778,25 @@ substituteAllFormula substitutions = goFormula Set.empty
         Maximum a b -> Maximum (goTerm seen a) (goTerm seen b)
         Triangular a -> Triangular (goTerm seen a)
 
-normalizeFormula :: Formula -> Formula
-normalizeFormula formula =
-  case formula of
-    Truth -> Truth
-    Falsity -> Falsity
-    Equal a b
-      | polynomial a == polynomial b -> Truth
-      | otherwise -> Equal (canonicalTerm a) (canonicalTerm b)
-    Less a b ->
-      let left = canonicalTerm a
-          right = canonicalTerm b
-      in case constantPair left right of
-           Just (x, y) -> if x < y then Truth else Falsity
-           Nothing -> Less left right
-    LessEqual a b ->
-      let left = canonicalTerm a
-          right = canonicalTerm b
-      in case constantPair left right of
-           Just (x, y) -> if x <= y then Truth else Falsity
-           Nothing -> LessEqual left right
-    And a b -> simplifyAnd (normalizeFormula a) (normalizeFormula b)
-    Not proposition ->
-      case normalizeFormula proposition of
-        Truth -> Falsity
-        Falsity -> Truth
-        Less a b -> LessEqual b a
-        LessEqual a b -> Less b a
-        Not inner -> inner
-        other -> Not other
-    Implies antecedent consequent ->
-      case (normalizeFormula antecedent, normalizeFormula consequent) of
-        (Falsity, _) -> Truth
-        (_, Truth) -> Truth
-        (Truth, other) -> other
-        (other, Falsity) -> normalizeFormula (Not other)
-        (left, right) -> Implies left right
-
-simplifyAnd :: Formula -> Formula -> Formula
-simplifyAnd Truth right = right
-simplifyAnd left Truth = left
-simplifyAnd Falsity _ = Falsity
-simplifyAnd _ Falsity = Falsity
-simplifyAnd left right | left == right = left
-simplifyAnd left right = And left right
-
-constantPair :: Term -> Term -> Maybe (Rational, Rational)
-constantPair a b = (,) <$> constantValue a <*> constantValue b
-
-constantValue :: Term -> Maybe Rational
-constantValue term =
-  case Map.toList (polynomial term) of
-    [] -> Just 0
-    [([], value)] -> Just value
-    _ -> Nothing
-
 knownComparison :: [Formula] -> Formula -> Bool
-knownComparison assumptions wanted =
-  wanted `elem` assumptions
-    || case wanted of
-         Less a b ->
-           LessEqual b a `elem` assumptions
-             || Less a b `elem` assumptions
-         LessEqual a b ->
-           Less b a `elem` assumptions
-             || LessEqual a b `elem` assumptions
-         _ -> False
+knownComparison assumptions wanted = wanted `elem` assumptions
 
-inconsistent :: [Formula] -> Bool
-inconsistent assumptions =
-  Falsity `elem` assumptions || any hasComplement assumptions
+contradictoryByFacts :: [Fact] -> [Formula] -> Bool
+contradictoryByFacts facts assumptions = any detects facts
   where
-    hasComplement (Less a b) = LessEqual b a `elem` assumptions
-    hasComplement (LessEqual a b) = Less b a `elem` assumptions
-    hasComplement (Equal a b) = Not (Equal a b) `elem` assumptions
-    hasComplement (Not proposition) = proposition `elem` assumptions
-    hasComplement _ = False
+    detects (FormulaImplication antecedent Falsity) =
+      case matchPremises emptyBindings (flattenAnd antecedent) assumptions of
+        Just _ -> True
+        Nothing -> False
+    detects _ = False
+
+    matchPremises bindings [] _ = Just bindings
+    matchPremises bindings (premise : premises) available =
+      firstJust
+        [ matchFormula bindings premise actual
+            >>= \next -> matchPremises next premises available
+        | actual <- available
+        ]
 
 prettyTerm :: Term -> String
 prettyTerm term =
@@ -738,12 +824,13 @@ prettyFormula formula =
     And a b -> "(" ++ prettyFormula a ++ " and " ++ prettyFormula b ++ ")"
     Not a -> "(not " ++ prettyFormula a ++ ")"
     Implies a b -> "(" ++ prettyFormula a ++ " implies " ++ prettyFormula b ++ ")"
+    FormulaMeta name -> name
   where
     relation operator a b =
       "(" ++ prettyTerm a ++ " " ++ operator ++ " " ++ prettyTerm b ++ ")"
 
 -- Book examples paired with optional facts used by the theorem prover.
-exampleSpecs :: [(String, String, [Formula])]
+exampleSpecs :: [(String, String, [Fact])]
 exampleSpecs =
   [ ( "swap without temporary (expected failure)"
     , unlines
@@ -850,10 +937,12 @@ exampleSpecs =
         , "    (ASSIGN MAX Y))"
         , "  (MAX = (max X Y)))"
         ]
-    , [ LessEqual (Variable "Y") (Variable "X")
-          `Implies` Equal (Variable "X") (Maximum (Variable "X") (Variable "Y"))
-      , Less (Variable "X") (Variable "Y")
-          `Implies` Equal (Variable "Y") (Maximum (Variable "X") (Variable "Y"))
+    , [ FormulaImplication
+          (LessEqual (Variable "Y") (Variable "X"))
+          (Equal (Variable "X") (Maximum (Variable "X") (Variable "Y")))
+      , FormulaImplication
+          (Less (Variable "X") (Variable "Y"))
+          (Equal (Variable "Y") (Maximum (Variable "X") (Variable "Y")))
       ]
     )
   ]
